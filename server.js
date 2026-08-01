@@ -56,16 +56,34 @@ app.get("/api/test-db", async (req, res) => {
 // ----------------------
 app.get("/api/inventory/search", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM products LIMIT 10");
+    const query = req.query.query;
+
+    if (!query) {
+      return res.json({ success: false, message: "No query provided" });
+    }
+
+    const result = await pool.query(`
+      SELECT v.*, p.title
+      FROM variants v
+      JOIN products p ON v.product_id = p.id
+      WHERE 
+        p.title ILIKE $1 OR
+        v.barcode ILIKE $1 OR
+        v.design_code ILIKE $1
+    `, [`%${query}%`]);
+
+    if (result.rows.length === 0) {
+      return res.json({ success: false });
+    }
+
     res.json({
       success: true,
-      data: result.rows,
+      items: result.rows
     });
+
   } catch (err) {
-    res.status(500).json({
-      success: false,
-      error: err.message,
-    });
+    console.error(err);
+    res.json({ success: false, error: err.message });
   }
 });
 
