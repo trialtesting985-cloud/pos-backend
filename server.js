@@ -58,6 +58,8 @@ app.get("/api/inventory/search", async (req, res) => {
   try {
     const query = req.query.query;
 
+    console.log("🔥 QUERY RECEIVED:", query);
+
     if (!query) {
       return res.json({ success: false, message: "No query provided" });
     }
@@ -72,6 +74,8 @@ app.get("/api/inventory/search", async (req, res) => {
         v.design_code ILIKE $1
     `, [`%${query}%`]);
 
+    console.log("🔥 RESULT COUNT:", result.rows.length);
+
     if (result.rows.length === 0) {
       return res.json({ success: false });
     }
@@ -82,8 +86,28 @@ app.get("/api/inventory/search", async (req, res) => {
     });
 
   } catch (err) {
-    console.error(err);
+    console.error("🔥 ERROR:", err);
     res.json({ success: false, error: err.message });
+  }
+});
+
+// ----------------------
+// INITIAL DATA (FRONTEND BOOT)
+// ----------------------
+app.get("/api/initial-data", async (req, res) => {
+  try {
+    // Minimal response for now
+    res.json({
+      success: true,
+      message: "Initial data API working",
+      bills: [],
+      inventory: []
+    });
+  } catch (err) {
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 
