@@ -96,21 +96,24 @@ app.get("/api/inventory/search", async (req, res) => {
 // ----------------------
 app.get("/api/initial-data", async (req, res) => {
   try {
-    // Minimal response for now
+    const products = await pool.query("SELECT * FROM products LIMIT 50");
+    const variants = await pool.query("SELECT * FROM variants LIMIT 50");
+
     res.json({
       success: true,
-      message: "Initial data API working",
+      products: products.rows,
+      variants: variants.rows,
       bills: [],
-      inventory: []
     });
+
   } catch (err) {
+    console.error(err);
     res.status(500).json({
       success: false,
       error: err.message
     });
   }
 });
-
 // ----------------------
 // SERVER START
 // ----------------------
