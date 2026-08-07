@@ -3,13 +3,24 @@ const cors = require("cors");
 const { Pool } = require("pg");
 require("dotenv").config();
 
-const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Middleware
+const authRoutes = require('./routes/authRoutes');
+const userRoutes = require('./routes/userRoutes');
+
+const app = express();
+
 app.use(cors());
 app.use(express.json());
 
+// ROUTES
+app.use('/api', authRoutes);
+app.use('/api', userRoutes);
+
+const PORT = process.env.PORT || 5000;
+
+app.listen(PORT, () => {
+  console.log(`Server running on ${PORT}`);
+});
 // ----------------------
 // DATABASE CONNECTION
 // ----------------------
@@ -372,5 +383,30 @@ app.get("/api/barcode/:code", async (req, res) => {
 
   } catch (err) {
     res.json({ success: false, error: err.message });
+  }
+});
+app.post("/api/save-mapping", async (req, res) => {
+  try {
+    const { parent, category, pattern, company } = req.body;
+
+    await pool.query(
+      `INSERT INTO mappings (parent_category, category, pattern, company)
+       VALUES ($1, $2, $3, $4)`,
+      [parent, category, pattern, company]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+app.get("/api/get-mappings", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT * FROM mappings");
+    res.json(result.rows);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
