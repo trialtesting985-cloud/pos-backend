@@ -1,12 +1,13 @@
 const express = require('express');
 const bcrypt = require('bcrypt');
-const { Pool } = require('pg');
+//const { Pool } = require('pg');
 
 const router = express.Router();
 
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-});
+//const pool = new Pool({
+  //connectionString: process.env.DATABASE_URL,
+//});
+const pool = require('../db');
 
 // CREATE STAFF
 router.post('/users', async (req, res) => {
