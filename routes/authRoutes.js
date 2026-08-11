@@ -44,7 +44,7 @@ router.post('/login', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '1d' }
     );
-
+const mustChangePassword = password === 'admin123';
     // ✅ FIXED RESPONSE FORMAT
     res.json({
       success: true,
