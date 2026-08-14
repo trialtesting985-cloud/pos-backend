@@ -44,11 +44,14 @@ router.post('/login', async (req, res) => {
       process.env.JWT_SECRET,
       { expiresIn: '1d' }
     );
-const mustChangePassword = password === 'admin123';
-    // ✅ FIXED RESPONSE FORMAT
+
+    // ✅ FIX: read from DB
+    const mustChangePassword = user.mustchangepassword;
+
     res.json({
       success: true,
       token,
+      mustChangePassword,
       user: {
         id: user.id,
         name: user.name,
