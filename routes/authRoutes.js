@@ -46,16 +46,18 @@ router.post('/login', async (req, res) => {
     );
 
     // ✅ FIX: read from DB
-    const mustChangePassword = user.mustchangepassword;
+    const mustChangePassword = user.mustchangepassword===true;
 
     res.json({
       success: true,
       token,
-      mustChangePassword,
+      
       user: {
         id: user.id,
         name: user.name,
         role: user.role,
+        mustChangePassword: user.must_change_password,
+        passwordUpdatedAt: user.password_updated_at
       },
     });
 
