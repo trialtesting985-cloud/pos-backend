@@ -2,7 +2,7 @@ const express = require("express");
 const cors = require("cors");
 const { Pool } = require("pg");
 require("dotenv").config();
-
+//const authRoutes = require('./routes/authRoutes');
 
 const authRoutes = require('./routes/authRoutes');
 const userRoutes = require('./routes/userRoutes');
@@ -21,6 +21,7 @@ const PORT = process.env.PORT || 5000;
 // ----------------------
 // DATABASE CONNECTION
 // ----------------------
+
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
@@ -104,22 +105,38 @@ app.get("/api/inventory/search", async (req, res) => {
 // ----------------------
 app.get("/api/initial-data", async (req, res) => {
   try {
-    const products = await pool.query("SELECT * FROM products LIMIT 50");
-    const variants = await pool.query("SELECT * FROM variants LIMIT 50");
+    const [
+      products,
+      variants,
+      categories,
+      parentCategories,
+      companies,
+      mappings
+    ] = await Promise.all([
+      pool.query("SELECT * FROM products"),
+      pool.query("SELECT * FROM variants"),
+      pool.query("SELECT * FROM categories"),
+      pool.query("SELECT * FROM parent_categories"),
+      pool.query("SELECT * FROM companies"),
+      pool.query("SELECT * FROM mappings") // or company_mappings (see below)
+    ]);
 
     res.json({
       success: true,
-      products: products.rows,
-      variants: variants.rows,
-      bills: [],
+      store: {
+        products: products.rows,
+        variants: variants.rows,
+        categories: categories.rows,
+        parentCategories: parentCategories.rows.map(p => p.name),
+        companies: companies.rows,
+        companyMappings: mappings.rows,
+        bills: [],
+        customers: []
+      }
     });
 
   } catch (err) {
-    console.error(err);
-    res.status(500).json({
-      success: false,
-      error: err.message
-    });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 // ----------------------
@@ -384,26 +401,66 @@ app.get("/api/barcode/:code", async (req, res) => {
 });
 app.post("/api/save-mapping", async (req, res) => {
   try {
-    const { parent, category, pattern, company } = req.body;
+    const { parentCategoryId, categoryId, companyId, patternId } = req.body;
 
     await pool.query(
-      `INSERT INTO mappings (parent_category, category, pattern, company)
+      `INSERT INTO company_mappings 
+       (parent_category_id, category_id, company_id, pattern_id)
        VALUES ($1, $2, $3, $4)`,
-      [parent, category, pattern, company]
+      [parentCategoryId, categoryId, companyId, patternId || null]
     );
 
     res.json({ success: true });
+
   } catch (err) {
-    console.error(err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 app.get("/api/get-mappings", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM mappings");
-    res.json(result.rows);
+    const result = await pool.query(`
+      SELECT 
+        m.id,
+        m.parent_category,
+        m.category,
+        m.pattern,
+        m.company,
+        c.id as company_id,
+        cat.id as category_id
+      FROM mappings m
+      LEFT JOIN companies c ON c.name = m.company
+      LEFT JOIN categories cat ON cat.name = m.category
+    `);
+
+    const formatted = result.rows.map(r => ({
+      id: r.id,
+      parentCategory: r.parent_category,
+      categoryName: r.category,
+      categoryId: r.category_id,
+      companyName: r.company,
+      companyId: r.company_id,
+      patternName: r.pattern
+    }));
+
+    res.json({ success: true, mappings: formatted });
+
   } catch (err) {
-    console.error(err);
     res.status(500).json({ success: false, error: err.message });
   }
+});
+app.get("/api/categories", async (req, res) => {
+  const result = await pool.query("SELECT * FROM categories");
+  res.json({ categories: result.rows });
+});
+
+
+app.get("/api/parent-categories", async (req, res) => {
+  const result = await pool.query("SELECT * FROM parent_categories");
+  res.json({ parentCategories: result.rows });
+});
+
+
+app.get("/api/companies", async (req, res) => {
+  const result = await pool.query("SELECT * FROM companies");
+  res.json({ companies: result.rows });
 });
