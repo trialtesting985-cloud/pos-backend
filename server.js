@@ -118,7 +118,7 @@ app.get("/api/initial-data", async (req, res) => {
       pool.query("SELECT * FROM categories"),
       pool.query("SELECT * FROM parent_categories"),
       pool.query("SELECT * FROM companies"),
-      pool.query("SELECT * FROM mappings") // or company_mappings (see below)
+      pool.query("SELECT * FROM company_mappings") // or company_mappings (see below)
     ]);
 
     res.json({
