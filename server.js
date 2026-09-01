@@ -111,32 +111,164 @@ app.get("/api/initial-data", async (req, res) => {
       categories,
       parentCategories,
       companies,
-      mappings
+      mappings,
+      sizes
     ] = await Promise.all([
-      pool.query("SELECT * FROM products"),
-      pool.query("SELECT * FROM variants"),
-      pool.query("SELECT * FROM categories"),
-      pool.query("SELECT * FROM parent_categories"),
-      pool.query("SELECT * FROM companies"),
-      pool.query("SELECT * FROM company_mappings") // or company_mappings (see below)
+
+      // PRODUCTS
+      pool.query(`
+        SELECT *
+        FROM products
+        ORDER BY id
+      `),
+
+      // VARIANTS
+      pool.query(`
+        SELECT *
+        FROM variants
+        ORDER BY id
+      `),
+
+      // CATEGORIES
+      pool.query(`
+        SELECT *
+        FROM categories
+        ORDER BY id
+      `),
+
+      // PARENT CATEGORIES
+      pool.query(`
+        SELECT *
+        FROM parent_categories
+        ORDER BY id
+      `),
+
+      // COMPANIES
+      pool.query(`
+        SELECT *
+        FROM companies
+        ORDER BY id
+      `),
+
+      // COMPANY MAPPINGS
+      pool.query(`
+        SELECT
+          m.id,
+
+          m.parent_category_id,
+          m.category_id,
+          m.company_id,
+          m.pattern_id,
+
+          pc.name AS parent_category,
+          cat.name AS category,
+          c.name AS company,
+          p.name AS pattern
+
+        FROM company_mappings m
+
+        LEFT JOIN parent_categories pc
+          ON pc.id = m.parent_category_id
+
+        LEFT JOIN categories cat
+          ON cat.id = m.category_id
+
+        LEFT JOIN companies c
+          ON c.id = m.company_id
+
+        LEFT JOIN patterns p
+          ON p.id = m.pattern_id
+
+        ORDER BY m.id
+      `),
+
+      // SIZES
+      pool.query(`
+        SELECT *
+        FROM sizes
+        ORDER BY id
+      `)
     ]);
+
+    // -----------------------------------------
+    // FORMAT COMPANY MAPPINGS FOR FRONTEND
+    // -----------------------------------------
+
+    const formattedMappings = mappings.rows.map(m => ({
+      id: m.id,
+
+      parentCategoryId: m.parent_category_id,
+      parentCategory: m.parent_category || "",
+
+      categoryId: m.category_id,
+      categoryName: m.category || "",
+
+      companyId: m.company_id,
+      companyName: m.company || "",
+
+      patternId: m.pattern_id,
+      patternName: m.pattern || ""
+    }));
+
+    // -----------------------------------------
+    // LOG EVERYTHING
+    // -----------------------------------------
+
+    console.log("=================================");
+    console.log("✅ INITIAL DATA LOADED");
+
+    console.log("Products:", products.rows.length);
+    console.log("Variants:", variants.rows.length);
+    console.log("Categories:", categories.rows.length);
+    console.log("Parent Categories:", parentCategories.rows.length);
+    console.log("Companies:", companies.rows.length);
+    console.log("Company Mappings:", formattedMappings.length);
+    console.log("Sizes:", sizes.rows.length);
+
+    console.log("Company Mappings:", formattedMappings);
+    console.log("Sizes:", sizes.rows);
+
+    console.log("=================================");
+
+    // -----------------------------------------
+    // SEND COMPLETE STORE DATA
+    // -----------------------------------------
 
     res.json({
       success: true,
+
       store: {
         products: products.rows,
+
         variants: variants.rows,
+
         categories: categories.rows,
-        parentCategories: parentCategories.rows.map(p => p.name),
+
+        parentCategories: parentCategories.rows.map(
+          p => p.name
+        ),
+
         companies: companies.rows,
-        companyMappings: mappings.rows,
+
+        companyMappings: formattedMappings,
+
+        // IMPORTANT
+        sizes: sizes.rows,
+
         bills: [],
+
         customers: []
       }
     });
 
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+
+    console.error("❌ INITIAL DATA ERROR:", err);
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 // ----------------------
@@ -401,51 +533,126 @@ app.get("/api/barcode/:code", async (req, res) => {
 });
 app.post("/api/save-mapping", async (req, res) => {
   try {
-    const { parentCategoryId, categoryId, companyId, patternId } = req.body;
+    const {
+      parentCategoryId,
+      categoryId,
+      companyId,
+      patternId
+    } = req.body;
 
-    await pool.query(
-      `INSERT INTO company_mappings 
-       (parent_category_id, category_id, company_id, pattern_id)
-       VALUES ($1, $2, $3, $4)`,
-      [parentCategoryId, categoryId, companyId, patternId || null]
+    console.log("🔥 SAVE MAPPING REQUEST:", {
+      parentCategoryId,
+      categoryId,
+      companyId,
+      patternId
+    });
+
+    if (!parentCategoryId || !categoryId || !companyId) {
+      return res.status(400).json({
+        success: false,
+        error: "parentCategoryId, categoryId and companyId are required"
+      });
+    }
+
+    const result = await pool.query(
+      `
+      INSERT INTO company_mappings
+        (
+          parent_category_id,
+          category_id,
+          company_id,
+          pattern_id
+        )
+      VALUES ($1, $2, $3, $4)
+      RETURNING *
+      `,
+      [
+        parentCategoryId,
+        categoryId,
+        companyId,
+        patternId || null
+      ]
     );
 
-    res.json({ success: true });
+    console.log("✅ MAPPING SAVED:", result.rows[0]);
+
+    res.json({
+      success: true,
+      mapping: result.rows[0]
+    });
 
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error("❌ SAVE MAPPING ERROR:", err);
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 app.get("/api/get-mappings", async (req, res) => {
   try {
     const result = await pool.query(`
-      SELECT 
+      SELECT
         m.id,
-        m.parent_category,
-        m.category,
-        m.pattern,
-        m.company,
-        c.id as company_id,
-        cat.id as category_id
-      FROM mappings m
-      LEFT JOIN companies c ON c.name = m.company
-      LEFT JOIN categories cat ON cat.name = m.category
+
+        m.parent_category_id,
+        m.category_id,
+        m.company_id,
+        m.pattern_id,
+
+        pc.name AS parent_category,
+        cat.name AS category,
+        c.name AS company,
+        p.name AS pattern
+
+      FROM company_mappings m
+
+      LEFT JOIN parent_categories pc
+        ON pc.id = m.parent_category_id
+
+      LEFT JOIN categories cat
+        ON cat.id = m.category_id
+
+      LEFT JOIN companies c
+        ON c.id = m.company_id
+
+      LEFT JOIN patterns p
+        ON p.id = m.pattern_id
+
+      ORDER BY m.id
     `);
 
     const formatted = result.rows.map(r => ({
       id: r.id,
-      parentCategory: r.parent_category,
-      categoryName: r.category,
+
+      parentCategoryId: r.parent_category_id,
+      parentCategory: r.parent_category || "",
+
       categoryId: r.category_id,
-      companyName: r.company,
+      categoryName: r.category || "",
+
       companyId: r.company_id,
-      patternName: r.pattern
+      companyName: r.company || "",
+
+      patternId: r.pattern_id,
+      patternName: r.pattern || ""
     }));
 
-    res.json({ success: true, mappings: formatted });
+    console.log("✅ COMPANY MAPPINGS LOADED:", formatted);
+
+    res.json({
+      success: true,
+      mappings: formatted
+    });
 
   } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
+    console.error("❌ GET MAPPINGS ERROR:", err);
+
+    res.status(500).json({
+      success: false,
+      error: err.message
+    });
   }
 });
 app.get("/api/categories", async (req, res) => {
