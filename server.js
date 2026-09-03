@@ -716,3 +716,124 @@ app.post("/api/bills/complete", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
+// ==============================================================================
+// 1. PATTERNS ROUTES (GET, POST, DELETE)
+// ==============================================================================
+app.get("/api/patterns", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.id, p.category_id AS "categoryId", p.name, p.code, c.name AS "categoryName"
+      FROM patterns p
+      LEFT JOIN categories c ON c.id = p.category_id
+      ORDER BY p.name ASC
+    `);
+    res.json({ success: true, patterns: result.rows });
+  } catch (err) {
+    console.error("❌ GET PATTERNS ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/patterns", async (req, res) => {
+  try {
+    const { name, categoryId, code } = req.body;
+    if (!name) {
+      return res.status(400).json({ success: false, error: "Pattern name is required" });
+    }
+
+    // Resolve categoryId to a valid UUID
+    let resolvedCatId = null;
+    if (isValidUUID(categoryId)) {
+      resolvedCatId = categoryId;
+    } else if (categoryId) {
+      const cRes = await pool.query(
+        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+        [String(categoryId).trim()]
+      );
+      if (cRes.rows.length > 0) resolvedCatId = cRes.rows[0].id;
+    }
+
+    if (!resolvedCatId) {
+      const defaultC = await pool.query("SELECT id FROM categories ORDER BY id LIMIT 1");
+      resolvedCatId = defaultC.rows[0]?.id;
+    }
+
+    if (!resolvedCatId) {
+      return res.status(400).json({ success: false, error: "No valid category found to attach pattern" });
+    }
+
+    const patternCode = (code || name.slice(0, 3)).toUpperCase();
+    const result = await pool.query(
+      `INSERT INTO patterns (category_id, name, code)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (category_id, name) DO UPDATE SET code = EXCLUDED.code
+       RETURNING id, category_id AS "categoryId", name, code`,
+      [resolvedCatId, String(name).trim().toUpperCase(), patternCode]
+    );
+
+    res.json({ success: true, pattern: result.rows[0] });
+  } catch (err) {
+    console.error("❌ CREATE PATTERN ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete("/api/patterns/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM patterns WHERE id = $1", [id]);
+    res.json({ success: true, message: "Pattern deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==============================================================================
+// 2. SIZES ROUTES (Matches exact Supabase sizes table columns: name, type, numeric_value)
+// ==============================================================================
+app.get("/api/sizes", async (req, res) => {
+  try {
+    const result = await pool.query("SELECT id, name, type, numeric_value FROM sizes ORDER BY id ASC");
+    res.json({ success: true, sizes: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+app.post("/api/sizes", async (req, res) => {
+  try {
+    const { name, type } = req.body;
+    if (!name) {
+      return res.status(400).json({ success: false, error: "Size name is required" });
+    }
+
+    const cleanName = String(name).trim().toUpperCase();
+    // Valid types in schema: 'numeric', 'alpha', 'kids'
+    const allowedTypes = ['numeric', 'alpha', 'kids'];
+    const sizeType = allowedTypes.includes(type?.toLowerCase()) ? type.toLowerCase() : (isNaN(Number(cleanName)) ? 'alpha' : 'numeric');
+    const numericVal = !isNaN(Number(cleanName)) && Number(cleanName) >= 10 && Number(cleanName) <= 100 ? parseInt(cleanName, 10) : null;
+
+    const result = await pool.query(
+      `INSERT INTO sizes (name, type, numeric_value)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (LOWER(name)) DO UPDATE SET type = EXCLUDED.type
+       RETURNING id, name, type, numeric_value`,
+      [cleanName, sizeType, numericVal]
+    );
+
+    res.json({ success: true, size: result.rows[0] });
+  } catch (err) {
+    console.error("❌ CREATE SIZE ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete("/api/sizes/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM sizes WHERE id = $1", [id]);
+    res.json({ success: true, message: "Size deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
