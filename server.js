@@ -24,11 +24,14 @@ const pool = new Pool({
 // Test DB connection on startup
 pool.connect()
   .then(() => console.log("✅ Database connected"))
-  .catch(err => console.error("❌ DB connection error:", err.message));
+  .catch((err) => console.error("❌ DB connection error:", err.message));
 
 // Helper to check valid UUID
 const isValidUUID = (str) => {
-  return typeof str === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+  return (
+    typeof str === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim())
+  );
 };
 
 // Health checks
@@ -47,7 +50,6 @@ app.get("/api/health", (req, res) => {
 // 1. Get all users
 app.get("/api/users", async (req, res) => {
   try {
-    // Queries all columns safely without assuming phone exists
     const result = await pool.query("SELECT * FROM users ORDER BY created_at DESC");
     const users = result.rows.map((u) => ({
       id: u.id,
@@ -152,8 +154,8 @@ app.post(["/api/login", "/api/auth/login"], async (req, res) => {
         name: user.name,
         username: user.username,
         role: user.role,
-        mustChangePassword: user.must_change_password || false
-      }
+        mustChangePassword: user.must_change_password || false,
+      },
     });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -165,42 +167,41 @@ app.post(["/api/login", "/api/auth/login"], async (req, res) => {
 // ----------------------
 app.get("/api/initial-data", async (req, res) => {
   try {
-    const [
-      products,
-      variants,
-      categories,
-      parentCategories,
-      companies,
-      mappings,
-      sizes
-    ] = await Promise.all([
-      pool.query("SELECT * FROM products ORDER BY id"),
-      pool.query("SELECT * FROM variants ORDER BY id"),
-      pool.query("SELECT * FROM categories ORDER BY name ASC"),
-      pool.query("SELECT * FROM parent_categories ORDER BY name ASC"),
-      pool.query("SELECT * FROM companies ORDER BY name ASC"),
-      pool.query(`
-        SELECT
-          m.id,
-          m.parent_category_id,
-          m.category_id,
-          m.company_id,
-          m.pattern_id,
-          pc.name AS parent_category,
-          cat.name AS category,
-          c.name AS company,
-          p.name AS pattern
-        FROM company_mappings m
-        LEFT JOIN parent_categories pc ON pc.id = m.parent_category_id
-        LEFT JOIN categories cat ON cat.id = m.category_id
-        LEFT JOIN companies c ON c.id = m.company_id
-        LEFT JOIN patterns p ON p.id = m.pattern_id
-        ORDER BY m.id
-      `),
-      pool.query("SELECT * FROM sizes ORDER BY id")
-    ]);
+    const [products, variants, categories, parentCategories, companies, mappings, sizes, patterns] =
+      await Promise.all([
+        pool.query("SELECT * FROM products ORDER BY id"),
+        pool.query("SELECT * FROM variants ORDER BY id"),
+        pool.query("SELECT * FROM categories ORDER BY name ASC"),
+        pool.query("SELECT * FROM parent_categories ORDER BY name ASC"),
+        pool.query("SELECT * FROM companies ORDER BY name ASC"),
+        pool.query(`
+          SELECT
+            m.id,
+            m.parent_category_id,
+            m.category_id,
+            m.company_id,
+            m.pattern_id,
+            pc.name AS parent_category,
+            cat.name AS category,
+            c.name AS company,
+            p.name AS pattern
+          FROM company_mappings m
+          LEFT JOIN parent_categories pc ON pc.id = m.parent_category_id
+          LEFT JOIN categories cat ON cat.id = m.category_id
+          LEFT JOIN companies c ON c.id = m.company_id
+          LEFT JOIN patterns p ON p.id = m.pattern_id
+          ORDER BY m.id
+        `),
+        pool.query("SELECT * FROM sizes ORDER BY id ASC"),
+        pool.query(`
+          SELECT p.id, p.category_id AS "categoryId", p.name, p.code, c.name AS "categoryName"
+          FROM patterns p
+          LEFT JOIN categories c ON c.id = p.category_id
+          ORDER BY p.name ASC
+        `),
+      ]);
 
-    const formattedMappings = mappings.rows.map(m => ({
+    const formattedMappings = mappings.rows.map((m) => ({
       id: m.id,
       parentCategoryId: m.parent_category_id,
       parentCategory: m.parent_category || "",
@@ -209,7 +210,7 @@ app.get("/api/initial-data", async (req, res) => {
       companyId: m.company_id,
       companyName: m.company || "",
       patternId: m.pattern_id,
-      patternName: m.pattern || ""
+      patternName: m.pattern || "",
     }));
 
     res.json({
@@ -222,9 +223,10 @@ app.get("/api/initial-data", async (req, res) => {
         companies: companies.rows,
         companyMappings: formattedMappings,
         sizes: sizes.rows,
+        patterns: patterns.rows,
         bills: [],
-        customers: []
-      }
+        customers: [],
+      },
     });
   } catch (err) {
     console.error("❌ INITIAL DATA ERROR:", err);
@@ -349,10 +351,79 @@ app.post("/api/companies", async (req, res) => {
   }
 });
 
-// Sizes
+// Patterns (GET, POST, DELETE)
+app.get("/api/patterns", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT p.id, p.category_id AS "categoryId", p.name, p.code, c.name AS "categoryName"
+      FROM patterns p
+      LEFT JOIN categories c ON c.id = p.category_id
+      ORDER BY p.name ASC
+    `);
+    res.json({ success: true, patterns: result.rows });
+  } catch (err) {
+    console.error("❌ GET PATTERNS ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.post("/api/patterns", async (req, res) => {
+  try {
+    const { name, categoryId, code } = req.body;
+    if (!name) {
+      return res.status(400).json({ success: false, error: "Pattern name is required" });
+    }
+
+    let resolvedCatId = null;
+    if (isValidUUID(categoryId)) {
+      resolvedCatId = categoryId;
+    } else if (categoryId) {
+      const cRes = await pool.query(
+        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+        [String(categoryId).trim()]
+      );
+      if (cRes.rows.length > 0) resolvedCatId = cRes.rows[0].id;
+    }
+
+    if (!resolvedCatId) {
+      const defaultC = await pool.query("SELECT id FROM categories ORDER BY id LIMIT 1");
+      resolvedCatId = defaultC.rows[0]?.id;
+    }
+
+    if (!resolvedCatId) {
+      return res.status(400).json({ success: false, error: "No valid category found to attach pattern" });
+    }
+
+    const patternCode = (code || name.slice(0, 3)).toUpperCase();
+    const result = await pool.query(
+      `INSERT INTO patterns (category_id, name, code)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (category_id, name) DO UPDATE SET code = EXCLUDED.code
+       RETURNING id, category_id AS "categoryId", name, code`,
+      [resolvedCatId, String(name).trim().toUpperCase(), patternCode]
+    );
+
+    res.json({ success: true, pattern: result.rows[0] });
+  } catch (err) {
+    console.error("❌ CREATE PATTERN ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+app.delete("/api/patterns/:id", async (req, res) => {
+  try {
+    const { id } = req.params;
+    await pool.query("DELETE FROM patterns WHERE id = $1", [id]);
+    res.json({ success: true, message: "Pattern deleted" });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Sizes (GET, POST, DELETE)
 app.get("/api/sizes", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM sizes ORDER BY id ASC");
+    const result = await pool.query("SELECT id, name, type, numeric_value FROM sizes ORDER BY id ASC");
     res.json({ success: true, sizes: result.rows });
   } catch (err) {
     res.status(500).json({ success: false, message: err.message });
@@ -360,26 +431,46 @@ app.get("/api/sizes", async (req, res) => {
 });
 
 app.post("/api/sizes", async (req, res) => {
-  const { name, code, category_id } = req.body;
   try {
-    const sizeId = "sz-" + Date.now();
+    const { name, type } = req.body;
+    if (!name) {
+      return res.status(400).json({ success: false, error: "Size name is required" });
+    }
+
+    const cleanName = String(name).trim().toUpperCase();
+    const allowedTypes = ["numeric", "alpha", "kids"];
+    const sizeType = allowedTypes.includes(type?.toLowerCase())
+      ? type.toLowerCase()
+      : isNaN(Number(cleanName))
+      ? "alpha"
+      : "numeric";
+    const numericVal =
+      !isNaN(Number(cleanName)) && Number(cleanName) >= 10 && Number(cleanName) <= 100
+        ? parseInt(cleanName, 10)
+        : null;
+
     const result = await pool.query(
-      "INSERT INTO sizes (id, name, code, category_id) VALUES ($1, $2, $3, $4) RETURNING *",
-      [sizeId, name, code || name, category_id || null]
+      `INSERT INTO sizes (name, type, numeric_value)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (LOWER(name)) DO UPDATE SET type = EXCLUDED.type
+       RETURNING id, name, type, numeric_value`,
+      [cleanName, sizeType, numericVal]
     );
+
     res.json({ success: true, size: result.rows[0] });
   } catch (err) {
+    console.error("❌ CREATE SIZE ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// Patterns
-app.get("/api/patterns", async (req, res) => {
+app.delete("/api/sizes/:id", async (req, res) => {
   try {
-    const result = await pool.query("SELECT * FROM patterns ORDER BY name ASC");
-    res.json({ success: true, patterns: result.rows });
+    const { id } = req.params;
+    await pool.query("DELETE FROM sizes WHERE id = $1", [id]);
+    res.json({ success: true, message: "Size deleted" });
   } catch (err) {
-    res.json({ success: true, patterns: [] });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -408,7 +499,7 @@ app.get("/api/get-mappings", async (req, res) => {
       ORDER BY m.id
     `);
 
-    const formatted = result.rows.map(r => ({
+    const formatted = result.rows.map((r) => ({
       id: r.id,
       parentCategoryId: r.parent_category_id,
       parentCategory: r.parent_category || "",
@@ -417,7 +508,7 @@ app.get("/api/get-mappings", async (req, res) => {
       companyId: r.company_id,
       companyName: r.company || "",
       patternId: r.pattern_id,
-      patternName: r.pattern || ""
+      patternName: r.pattern || "",
     }));
 
     res.json({ success: true, mappings: formatted });
@@ -434,14 +525,17 @@ app.post("/api/save-mapping", async (req, res) => {
     const categoryInput = body.categoryId || body.categoryName || body.category;
     const patternIdInput = body.patternId || null;
 
-    const companyInputs = Array.isArray(body.companyIds) && body.companyIds.length > 0
-      ? body.companyIds
-      : (body.companyId ? [body.companyId] : []);
+    const companyInputs =
+      Array.isArray(body.companyIds) && body.companyIds.length > 0
+        ? body.companyIds
+        : body.companyId
+        ? [body.companyId]
+        : [];
 
     if (!parentCategoryInput || !categoryInput || companyInputs.length === 0) {
       return res.status(400).json({
         success: false,
-        error: "parentCategoryId, categoryId and companyId are required"
+        error: "parentCategoryId, categoryId and companyId are required",
       });
     }
 
@@ -532,7 +626,7 @@ app.post("/api/save-mapping", async (req, res) => {
     res.json({
       success: true,
       mapping: savedMappings[0],
-      mappings: savedMappings
+      mappings: savedMappings,
     });
   } catch (err) {
     console.error("❌ SAVE MAPPING ERROR:", err);
@@ -559,7 +653,8 @@ app.get("/api/inventory/search", async (req, res) => {
     const query = req.query.query;
     if (!query) return res.json({ success: false, message: "No query provided" });
 
-    const result = await pool.query(`
+    const result = await pool.query(
+      `
       SELECT v.*, p.title
       FROM variants v
       JOIN products p ON v.product_id = p.id
@@ -567,7 +662,9 @@ app.get("/api/inventory/search", async (req, res) => {
         p.title ILIKE $1 OR
         v.barcode ILIKE $1 OR
         v.design_code ILIKE $1
-    `, [`%${query}%`]);
+    `,
+      [`%${query}%`]
+    );
 
     res.json({ success: true, items: result.rows });
   } catch (err) {
@@ -612,10 +709,7 @@ app.post("/api/stock/in", async (req, res) => {
 app.post("/api/stock/out", async (req, res) => {
   const { barcode, qty } = req.body;
   try {
-    const result = await pool.query(
-      `SELECT deduct_inventory_stock_atomic($1, $2, 'staff') AS result`,
-      [barcode, qty]
-    );
+    const result = await pool.query(`SELECT deduct_inventory_stock_atomic($1, $2, 'staff') AS result`, [barcode, qty]);
     res.json(result.rows[0].result);
   } catch (err) {
     res.json({ success: false, error: err.message });
@@ -675,7 +769,7 @@ app.post("/api/bills/create", async (req, res) => {
           row.size || "",
           qty,
           row.mrp || 0,
-          (row.mrp || 0) * qty
+          (row.mrp || 0) * qty,
         ]
       );
     }
@@ -711,129 +805,8 @@ app.post("/api/bills/complete", async (req, res) => {
 });
 
 // ----------------------
-// START SERVER (At the bottom after all routes)
+// START SERVER (Strictly at the very bottom after all routes)
 // ----------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
-// ==============================================================================
-// 1. PATTERNS ROUTES (GET, POST, DELETE)
-// ==============================================================================
-app.get("/api/patterns", async (req, res) => {
-  try {
-    const result = await pool.query(`
-      SELECT p.id, p.category_id AS "categoryId", p.name, p.code, c.name AS "categoryName"
-      FROM patterns p
-      LEFT JOIN categories c ON c.id = p.category_id
-      ORDER BY p.name ASC
-    `);
-    res.json({ success: true, patterns: result.rows });
-  } catch (err) {
-    console.error("❌ GET PATTERNS ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.post("/api/patterns", async (req, res) => {
-  try {
-    const { name, categoryId, code } = req.body;
-    if (!name) {
-      return res.status(400).json({ success: false, error: "Pattern name is required" });
-    }
-
-    // Resolve categoryId to a valid UUID
-    let resolvedCatId = null;
-    if (isValidUUID(categoryId)) {
-      resolvedCatId = categoryId;
-    } else if (categoryId) {
-      const cRes = await pool.query(
-        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
-        [String(categoryId).trim()]
-      );
-      if (cRes.rows.length > 0) resolvedCatId = cRes.rows[0].id;
-    }
-
-    if (!resolvedCatId) {
-      const defaultC = await pool.query("SELECT id FROM categories ORDER BY id LIMIT 1");
-      resolvedCatId = defaultC.rows[0]?.id;
-    }
-
-    if (!resolvedCatId) {
-      return res.status(400).json({ success: false, error: "No valid category found to attach pattern" });
-    }
-
-    const patternCode = (code || name.slice(0, 3)).toUpperCase();
-    const result = await pool.query(
-      `INSERT INTO patterns (category_id, name, code)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (category_id, name) DO UPDATE SET code = EXCLUDED.code
-       RETURNING id, category_id AS "categoryId", name, code`,
-      [resolvedCatId, String(name).trim().toUpperCase(), patternCode]
-    );
-
-    res.json({ success: true, pattern: result.rows[0] });
-  } catch (err) {
-    console.error("❌ CREATE PATTERN ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete("/api/patterns/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query("DELETE FROM patterns WHERE id = $1", [id]);
-    res.json({ success: true, message: "Pattern deleted" });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==============================================================================
-// 2. SIZES ROUTES (Matches exact Supabase sizes table columns: name, type, numeric_value)
-// ==============================================================================
-app.get("/api/sizes", async (req, res) => {
-  try {
-    const result = await pool.query("SELECT id, name, type, numeric_value FROM sizes ORDER BY id ASC");
-    res.json({ success: true, sizes: result.rows });
-  } catch (err) {
-    res.status(500).json({ success: false, message: err.message });
-  }
-});
-
-app.post("/api/sizes", async (req, res) => {
-  try {
-    const { name, type } = req.body;
-    if (!name) {
-      return res.status(400).json({ success: false, error: "Size name is required" });
-    }
-
-    const cleanName = String(name).trim().toUpperCase();
-    // Valid types in schema: 'numeric', 'alpha', 'kids'
-    const allowedTypes = ['numeric', 'alpha', 'kids'];
-    const sizeType = allowedTypes.includes(type?.toLowerCase()) ? type.toLowerCase() : (isNaN(Number(cleanName)) ? 'alpha' : 'numeric');
-    const numericVal = !isNaN(Number(cleanName)) && Number(cleanName) >= 10 && Number(cleanName) <= 100 ? parseInt(cleanName, 10) : null;
-
-    const result = await pool.query(
-      `INSERT INTO sizes (name, type, numeric_value)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (LOWER(name)) DO UPDATE SET type = EXCLUDED.type
-       RETURNING id, name, type, numeric_value`,
-      [cleanName, sizeType, numericVal]
-    );
-
-    res.json({ success: true, size: result.rows[0] });
-  } catch (err) {
-    console.error("❌ CREATE SIZE ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-app.delete("/api/sizes/:id", async (req, res) => {
-  try {
-    const { id } = req.params;
-    await pool.query("DELETE FROM sizes WHERE id = $1", [id]);
-    res.json({ success: true, message: "Size deleted" });
-  } catch (err) {
-    res.status(500).json({ success: false, error: err.message });
-  }
 });
