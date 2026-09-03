@@ -510,3 +510,193 @@ app.post("/api/bills/complete", async (req, res) => {
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
+// ==============================================================================
+// HELPER: Check if a string is a valid UUID
+// ==============================================================================
+const isValidUUID = (str) => {
+  return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+};
+
+// ==============================================================================
+// 1. SAVE COMPANY MAPPINGS (Single & Multi-Select with Auto UUID Resolution)
+// ==============================================================================
+app.post("/api/save-mapping", async (req, res) => {
+  try {
+    const body = req.body;
+    const parentCategoryInput = body.parentCategoryId || body.parentCategory || body.parentCategoryName || body.parent;
+    const categoryInput = body.categoryId || body.categoryName || body.category;
+    const patternIdInput = body.patternId || null;
+
+    // Collect all company IDs / names (handles single companyId or array companyIds)
+    const companyInputs = Array.isArray(body.companyIds) && body.companyIds.length > 0
+      ? body.companyIds
+      : (body.companyId ? [body.companyId] : []);
+
+    if (!parentCategoryInput || !categoryInput || companyInputs.length === 0) {
+      return res.status(400).json({
+        success: false,
+        error: "parentCategoryId, categoryId and companyId are required"
+      });
+    }
+
+    // A. Resolve parent_category_id
+    let resolvedParentId = null;
+    if (isValidUUID(parentCategoryInput)) {
+      resolvedParentId = parentCategoryInput;
+    } else {
+      const pRes = await pool.query(
+        "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+        [String(parentCategoryInput).trim()]
+      );
+      if (pRes.rows.length > 0) {
+        resolvedParentId = pRes.rows[0].id;
+      } else {
+        const pIns = await pool.query(
+          "INSERT INTO parent_categories (name, code) VALUES ($1, $2) RETURNING id",
+          [String(parentCategoryInput).trim(), String(parentCategoryInput).trim().slice(0, 3).toUpperCase()]
+        );
+        resolvedParentId = pIns.rows[0].id;
+      }
+    }
+
+    // B. Resolve category_id
+    let resolvedCatId = null;
+    if (isValidUUID(categoryInput)) {
+      resolvedCatId = categoryInput;
+    } else {
+      const catName = body.categoryName || categoryInput;
+      const cRes = await pool.query(
+        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) AND parent_category_id = $2 LIMIT 1",
+        [String(catName).trim(), resolvedParentId]
+      );
+      if (cRes.rows.length > 0) {
+        resolvedCatId = cRes.rows[0].id;
+      } else {
+        const cIns = await pool.query(
+          "INSERT INTO categories (parent_category_id, name, code) VALUES ($1, $2, $3) RETURNING id",
+          [resolvedParentId, String(catName).trim(), String(catName).trim().slice(0, 3).toUpperCase()]
+        );
+        resolvedCatId = cIns.rows[0].id;
+      }
+    }
+
+    // C. Resolve and insert each company mapping
+    const savedMappings = [];
+    for (const cmpInput of companyInputs) {
+      let resolvedCmpId = null;
+      if (isValidUUID(cmpInput)) {
+        resolvedCmpId = cmpInput;
+      } else {
+        const cmpName = body.companyName || cmpInput;
+        const compRes = await pool.query(
+          "SELECT id FROM companies WHERE UPPER(name) = UPPER($1) LIMIT 1",
+          [String(cmpName).trim()]
+        );
+        if (compRes.rows.length > 0) {
+          resolvedCmpId = compRes.rows[0].id;
+        } else {
+          const compIns = await pool.query(
+            "INSERT INTO companies (name, code) VALUES ($1, $2) RETURNING id",
+            [String(cmpName).trim(), String(cmpName).trim().slice(0, 3).toUpperCase()]
+          );
+          resolvedCmpId = compIns.rows[0].id;
+        }
+      }
+
+      // Check if mapping already exists
+      const existing = await pool.query(
+        `SELECT * FROM company_mappings 
+         WHERE parent_category_id = $1 AND category_id = $2 AND company_id = $3 LIMIT 1`,
+        [resolvedParentId, resolvedCatId, resolvedCmpId]
+      );
+
+      if (existing.rows.length > 0) {
+        savedMappings.push(existing.rows[0]);
+      } else {
+        const insertRes = await pool.query(
+          `INSERT INTO company_mappings (parent_category_id, category_id, company_id, pattern_id)
+           VALUES ($1, $2, $3, $4)
+           RETURNING *`,
+          [resolvedParentId, resolvedCatId, resolvedCmpId, isValidUUID(patternIdInput) ? patternIdInput : null]
+        );
+        savedMappings.push(insertRes.rows[0]);
+      }
+    }
+
+    res.json({
+      success: true,
+      mapping: savedMappings[0],
+      mappings: savedMappings
+    });
+  } catch (err) {
+    console.error("❌ SAVE MAPPING ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==============================================================================
+// 2. CREATE CATEGORY
+// ==============================================================================
+app.post("/api/categories", async (req, res) => {
+  try {
+    const { name, parentCategory, code } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: "Category name is required" });
+
+    let parentId = null;
+    if (parentCategory) {
+      const pRes = await pool.query(
+        "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+        [String(parentCategory).trim()]
+      );
+      if (pRes.rows.length > 0) parentId = pRes.rows[0].id;
+    }
+
+    if (!parentId) {
+      const defaultP = await pool.query("SELECT id FROM parent_categories ORDER BY id LIMIT 1");
+      parentId = defaultP.rows[0]?.id;
+    }
+
+    const result = await pool.query(
+      `INSERT INTO categories (parent_category_id, name, code)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (parent_category_id, name) DO UPDATE SET name = EXCLUDED.name
+       RETURNING *`,
+      [parentId, String(name).trim().toUpperCase(), (code || name.slice(0, 3)).toUpperCase()]
+    );
+
+    res.json({ success: true, category: result.rows[0] });
+  } catch (err) {
+    console.error("❌ CREATE CATEGORY ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// ==============================================================================
+// 3. CREATE COMPANIES
+// ==============================================================================
+app.post("/api/companies", async (req, res) => {
+  try {
+    const items = Array.isArray(req.body.companies) ? req.body.companies : [req.body];
+    const saved = [];
+
+    for (const item of items) {
+      const name = item.name || item.companyName;
+      const code = item.code || item.companyCode || (name ? name.slice(0, 3).toUpperCase() : "CMP");
+      if (!name) continue;
+
+      const result = await pool.query(
+        `INSERT INTO companies (name, code)
+         VALUES ($1, $2)
+         ON CONFLICT (name) DO UPDATE SET code = EXCLUDED.code
+         RETURNING *`,
+        [String(name).trim().toUpperCase(), String(code).trim().toUpperCase()]
+      );
+      saved.push(result.rows[0]);
+    }
+
+    res.json({ success: true, companies: saved, company: saved[0] });
+  } catch (err) {
+    console.error("❌ CREATE COMPANY ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
