@@ -47,20 +47,19 @@ app.get("/api/health", (req, res) => {
 // 1. Get all users
 app.get("/api/users", async (req, res) => {
   try {
-    const result = await pool.query(
-      `SELECT 
-        id, 
-        COALESCE(full_name, username) AS name, 
-        full_name, 
-        username, 
-        phone, 
-        role, 
-        created_at, 
-        password_updated_at 
-       FROM users 
-       ORDER BY created_at DESC`
-    );
-    res.json({ success: true, users: result.rows });
+    // Queries all columns safely without assuming phone exists
+    const result = await pool.query("SELECT * FROM users ORDER BY created_at DESC");
+    const users = result.rows.map((u) => ({
+      id: u.id,
+      name: u.full_name || u.name || u.username,
+      username: u.username,
+      phone: u.phone || u.email || "",
+      role: (u.role || "staff").toLowerCase(),
+      created_at: u.created_at,
+      mustChangePassword: u.must_change_password || false,
+      password_updated_at: u.password_updated_at,
+    }));
+    res.json({ success: true, users });
   } catch (err) {
     console.error("❌ GET USERS ERROR:", err);
     res.status(500).json({ success: false, message: err.message });
@@ -69,7 +68,7 @@ app.get("/api/users", async (req, res) => {
 
 // 2. Create new user
 app.post("/api/users", async (req, res) => {
-  const { name, username, phone, role, password, email } = req.body;
+  const { name, username, role, password, email } = req.body;
   if (!username || !name) {
     return res.status(400).json({ success: false, message: "Name and username are required" });
   }
@@ -77,10 +76,10 @@ app.post("/api/users", async (req, res) => {
   try {
     const userEmail = email?.trim() || `${username.trim().toLowerCase()}@pos.local`;
     const result = await pool.query(
-      `INSERT INTO users (full_name, username, email, phone, role, password_hash, created_at, password_updated_at)
-       VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       RETURNING id, full_name AS name, username, phone, role, created_at`,
-      [name.trim(), username.trim().toLowerCase(), userEmail, phone?.trim() || null, role || "STAFF", password || "123456"]
+      `INSERT INTO users (full_name, username, email, password_hash, role, is_active)
+       VALUES ($1, $2, $3, $4, $5, TRUE)
+       RETURNING id, full_name AS name, username, role, created_at`,
+      [name.trim(), username.trim().toLowerCase(), userEmail, password || "123456", (role || "STAFF").toUpperCase()]
     );
 
     res.json({ success: true, user: result.rows[0] });
