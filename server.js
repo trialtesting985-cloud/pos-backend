@@ -26,7 +26,12 @@ pool.connect()
   .then(() => console.log("✅ Database connected"))
   .catch(err => console.error("❌ DB connection error:", err.message));
 
-// Health check
+// Helper to check valid UUID
+const isValidUUID = (str) => {
+  return typeof str === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
+};
+
+// Health checks
 app.get("/", (req, res) => {
   res.send("POS Backend Running ✅");
 });
@@ -43,7 +48,15 @@ app.get("/api/health", (req, res) => {
 app.get("/api/users", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, username, phone, role, created_at, password_updated_at 
+      `SELECT 
+        id, 
+        COALESCE(full_name, username) AS name, 
+        full_name, 
+        username, 
+        phone, 
+        role, 
+        created_at, 
+        password_updated_at 
        FROM users 
        ORDER BY created_at DESC`
     );
@@ -56,18 +69,18 @@ app.get("/api/users", async (req, res) => {
 
 // 2. Create new user
 app.post("/api/users", async (req, res) => {
-  const { name, username, phone, role, password } = req.body;
+  const { name, username, phone, role, password, email } = req.body;
   if (!username || !name) {
     return res.status(400).json({ success: false, message: "Name and username are required" });
   }
 
   try {
-    const userId = "usr-" + Date.now();
+    const userEmail = email?.trim() || `${username.trim().toLowerCase()}@pos.local`;
     const result = await pool.query(
-      `INSERT INTO users (id, name, username, phone, role, password_hash, created_at, password_updated_at)
+      `INSERT INTO users (full_name, username, email, phone, role, password_hash, created_at, password_updated_at)
        VALUES ($1, $2, $3, $4, $5, $6, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
-       RETURNING id, name, username, phone, role, created_at`,
-      [userId, name.trim(), username.trim().toLowerCase(), phone?.trim() || null, role || "staff", password || "123456"]
+       RETURNING id, full_name AS name, username, phone, role, created_at`,
+      [name.trim(), username.trim().toLowerCase(), userEmail, phone?.trim() || null, role || "STAFF", password || "123456"]
     );
 
     res.json({ success: true, user: result.rows[0] });
@@ -117,7 +130,7 @@ app.post(["/api/login", "/api/auth/login"], async (req, res) => {
 
   try {
     const result = await pool.query(
-      `SELECT id, name, username, phone, role, password_hash, must_change_password 
+      `SELECT id, COALESCE(full_name, username) AS name, username, phone, role, password_hash, must_change_password 
        FROM users 
        WHERE LOWER(username) = LOWER($1)`,
       [username.trim()]
@@ -164,9 +177,9 @@ app.get("/api/initial-data", async (req, res) => {
     ] = await Promise.all([
       pool.query("SELECT * FROM products ORDER BY id"),
       pool.query("SELECT * FROM variants ORDER BY id"),
-      pool.query("SELECT * FROM categories ORDER BY id"),
-      pool.query("SELECT * FROM parent_categories ORDER BY id"),
-      pool.query("SELECT * FROM companies ORDER BY id"),
+      pool.query("SELECT * FROM categories ORDER BY name ASC"),
+      pool.query("SELECT * FROM parent_categories ORDER BY name ASC"),
+      pool.query("SELECT * FROM companies ORDER BY name ASC"),
       pool.query(`
         SELECT
           m.id,
@@ -206,7 +219,7 @@ app.get("/api/initial-data", async (req, res) => {
         products: products.rows,
         variants: variants.rows,
         categories: categories.rows,
-        parentCategories: parentCategories.rows, // Return full objects with id, name
+        parentCategories: parentCategories.rows,
         companies: companies.rows,
         companyMappings: formattedMappings,
         sizes: sizes.rows,
@@ -224,21 +237,120 @@ app.get("/api/initial-data", async (req, res) => {
 // CATALOG & SETTINGS ROUTES
 // ----------------------
 
+// Categories
 app.get("/api/categories", async (req, res) => {
-  const result = await pool.query("SELECT * FROM categories ORDER BY name ASC");
-  res.json({ success: true, categories: result.rows });
+  try {
+    const result = await pool.query("SELECT * FROM categories ORDER BY name ASC");
+    res.json({ success: true, categories: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
+app.post("/api/categories", async (req, res) => {
+  try {
+    const { name, parentCategory, code } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: "Category name is required" });
+
+    let parentId = null;
+    if (parentCategory) {
+      if (isValidUUID(parentCategory)) {
+        parentId = parentCategory;
+      } else {
+        const pRes = await pool.query(
+          "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+          [String(parentCategory).trim()]
+        );
+        if (pRes.rows.length > 0) parentId = pRes.rows[0].id;
+      }
+    }
+
+    if (!parentId) {
+      const defaultP = await pool.query("SELECT id FROM parent_categories ORDER BY id LIMIT 1");
+      parentId = defaultP.rows[0]?.id;
+    }
+
+    const result = await pool.query(
+      `INSERT INTO categories (parent_category_id, name, code)
+       VALUES ($1, $2, $3)
+       ON CONFLICT (parent_category_id, name) DO UPDATE SET name = EXCLUDED.name
+       RETURNING *`,
+      [parentId, String(name).trim().toUpperCase(), (code || name.slice(0, 3)).toUpperCase()]
+    );
+
+    res.json({ success: true, category: result.rows[0] });
+  } catch (err) {
+    console.error("❌ CREATE CATEGORY ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Parent Categories
 app.get("/api/parent-categories", async (req, res) => {
-  const result = await pool.query("SELECT * FROM parent_categories ORDER BY name ASC");
-  res.json({ success: true, parentCategories: result.rows });
+  try {
+    const result = await pool.query("SELECT * FROM parent_categories ORDER BY name ASC");
+    res.json({ success: true, parentCategories: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
+app.post("/api/parent-categories", async (req, res) => {
+  try {
+    const { name, code } = req.body;
+    if (!name) return res.status(400).json({ success: false, error: "Name is required" });
+
+    const result = await pool.query(
+      `INSERT INTO parent_categories (name, code)
+       VALUES ($1, $2)
+       ON CONFLICT (name) DO UPDATE SET code = EXCLUDED.code
+       RETURNING *`,
+      [String(name).trim(), (code || name.slice(0, 3)).toUpperCase()]
+    );
+    res.json({ success: true, parentCategory: result.rows[0] });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Companies
 app.get("/api/companies", async (req, res) => {
-  const result = await pool.query("SELECT * FROM companies ORDER BY name ASC");
-  res.json({ success: true, companies: result.rows });
+  try {
+    const result = await pool.query("SELECT * FROM companies ORDER BY name ASC");
+    res.json({ success: true, companies: result.rows });
+  } catch (err) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
 
+app.post("/api/companies", async (req, res) => {
+  try {
+    const items = Array.isArray(req.body.companies) ? req.body.companies : [req.body];
+    const saved = [];
+
+    for (const item of items) {
+      const name = item.name || item.companyName;
+      const code = item.code || item.companyCode || (name ? name.slice(0, 3).toUpperCase() : "CMP");
+      if (!name) continue;
+
+      const result = await pool.query(
+        `INSERT INTO companies (name, code)
+         VALUES ($1, $2)
+         ON CONFLICT (name) DO UPDATE SET code = EXCLUDED.code
+         RETURNING *`,
+        [String(name).trim().toUpperCase(), String(code).trim().toUpperCase()]
+      );
+      saved.push(result.rows[0]);
+    }
+
+    res.json({ success: true, companies: saved, company: saved[0] });
+  } catch (err) {
+    console.error("❌ CREATE COMPANY ERROR:", err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+// Sizes
 app.get("/api/sizes", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM sizes ORDER BY id ASC");
@@ -262,6 +374,7 @@ app.post("/api/sizes", async (req, res) => {
   }
 });
 
+// Patterns
 app.get("/api/patterns", async (req, res) => {
   try {
     const result = await pool.query("SELECT * FROM patterns ORDER BY name ASC");
@@ -314,25 +427,116 @@ app.get("/api/get-mappings", async (req, res) => {
   }
 });
 
+// Save Mapping (Handles Single, Batch, and UUID Auto-Resolution)
 app.post("/api/save-mapping", async (req, res) => {
   try {
-    const { parentCategoryId, categoryId, companyId, patternId } = req.body;
-    if (!parentCategoryId || !categoryId || !companyId) {
+    const body = req.body;
+    const parentCategoryInput = body.parentCategoryId || body.parentCategory || body.parentCategoryName || body.parent;
+    const categoryInput = body.categoryId || body.categoryName || body.category;
+    const patternIdInput = body.patternId || null;
+
+    const companyInputs = Array.isArray(body.companyIds) && body.companyIds.length > 0
+      ? body.companyIds
+      : (body.companyId ? [body.companyId] : []);
+
+    if (!parentCategoryInput || !categoryInput || companyInputs.length === 0) {
       return res.status(400).json({
         success: false,
         error: "parentCategoryId, categoryId and companyId are required"
       });
     }
 
-    const result = await pool.query(
-      `INSERT INTO company_mappings (parent_category_id, category_id, company_id, pattern_id)
-       VALUES ($1, $2, $3, $4)
-       RETURNING *`,
-      [parentCategoryId, categoryId, companyId, patternId || null]
-    );
+    // A. Resolve parent_category_id
+    let resolvedParentId = null;
+    if (isValidUUID(parentCategoryInput)) {
+      resolvedParentId = parentCategoryInput;
+    } else {
+      const pRes = await pool.query(
+        "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
+        [String(parentCategoryInput).trim()]
+      );
+      if (pRes.rows.length > 0) {
+        resolvedParentId = pRes.rows[0].id;
+      } else {
+        const pIns = await pool.query(
+          "INSERT INTO parent_categories (name, code) VALUES ($1, $2) RETURNING id",
+          [String(parentCategoryInput).trim(), String(parentCategoryInput).trim().slice(0, 3).toUpperCase()]
+        );
+        resolvedParentId = pIns.rows[0].id;
+      }
+    }
 
-    res.json({ success: true, mapping: result.rows[0] });
+    // B. Resolve category_id
+    let resolvedCatId = null;
+    if (isValidUUID(categoryInput)) {
+      resolvedCatId = categoryInput;
+    } else {
+      const catName = body.categoryName || categoryInput;
+      const cRes = await pool.query(
+        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) AND parent_category_id = $2 LIMIT 1",
+        [String(catName).trim(), resolvedParentId]
+      );
+      if (cRes.rows.length > 0) {
+        resolvedCatId = cRes.rows[0].id;
+      } else {
+        const cIns = await pool.query(
+          "INSERT INTO categories (parent_category_id, name, code) VALUES ($1, $2, $3) RETURNING id",
+          [resolvedParentId, String(catName).trim(), String(catName).trim().slice(0, 3).toUpperCase()]
+        );
+        resolvedCatId = cIns.rows[0].id;
+      }
+    }
+
+    // C. Resolve and insert each company mapping
+    const savedMappings = [];
+    for (const cmpInput of companyInputs) {
+      let resolvedCmpId = null;
+      if (isValidUUID(cmpInput)) {
+        resolvedCmpId = cmpInput;
+      } else {
+        const cmpName = body.companyName || cmpInput;
+        const compRes = await pool.query(
+          "SELECT id FROM companies WHERE UPPER(name) = UPPER($1) LIMIT 1",
+          [String(cmpName).trim()]
+        );
+        if (compRes.rows.length > 0) {
+          resolvedCmpId = compRes.rows[0].id;
+        } else {
+          const compIns = await pool.query(
+            "INSERT INTO companies (name, code) VALUES ($1, $2) RETURNING id",
+            [String(cmpName).trim(), String(cmpName).trim().slice(0, 3).toUpperCase()]
+          );
+          resolvedCmpId = compIns.rows[0].id;
+        }
+      }
+
+      // Check existing mapping
+      const existing = await pool.query(
+        `SELECT * FROM company_mappings 
+         WHERE parent_category_id = $1 AND category_id = $2 AND company_id = $3 LIMIT 1`,
+        [resolvedParentId, resolvedCatId, resolvedCmpId]
+      );
+
+      if (existing.rows.length > 0) {
+        savedMappings.push(existing.rows[0]);
+      } else {
+        const insertRes = await pool.query(
+          `INSERT INTO company_mappings (parent_category_id, category_id, company_id, pattern_id)
+           VALUES ($1, $2, $3, $4)
+           RETURNING *`,
+          [resolvedParentId, resolvedCatId, resolvedCmpId, isValidUUID(patternIdInput) ? patternIdInput : null]
+        );
+        savedMappings.push(insertRes.rows[0]);
+      }
+    }
+
+    res.json({
+      success: true,
+      mapping: savedMappings[0],
+      mappings: savedMappings
+    });
   } catch (err) {
+    console.error("❌ SAVE MAPPING ERROR:", err);
     res.status(500).json({ success: false, error: err.message });
   }
 });
@@ -507,196 +711,9 @@ app.post("/api/bills/complete", async (req, res) => {
   }
 });
 
+// ----------------------
+// START SERVER (At the bottom after all routes)
+// ----------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
-});
-// ==============================================================================
-// HELPER: Check if a string is a valid UUID
-// ==============================================================================
-const isValidUUID = (str) => {
-  return typeof str === 'string' && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim());
-};
-
-// ==============================================================================
-// 1. SAVE COMPANY MAPPINGS (Single & Multi-Select with Auto UUID Resolution)
-// ==============================================================================
-app.post("/api/save-mapping", async (req, res) => {
-  try {
-    const body = req.body;
-    const parentCategoryInput = body.parentCategoryId || body.parentCategory || body.parentCategoryName || body.parent;
-    const categoryInput = body.categoryId || body.categoryName || body.category;
-    const patternIdInput = body.patternId || null;
-
-    // Collect all company IDs / names (handles single companyId or array companyIds)
-    const companyInputs = Array.isArray(body.companyIds) && body.companyIds.length > 0
-      ? body.companyIds
-      : (body.companyId ? [body.companyId] : []);
-
-    if (!parentCategoryInput || !categoryInput || companyInputs.length === 0) {
-      return res.status(400).json({
-        success: false,
-        error: "parentCategoryId, categoryId and companyId are required"
-      });
-    }
-
-    // A. Resolve parent_category_id
-    let resolvedParentId = null;
-    if (isValidUUID(parentCategoryInput)) {
-      resolvedParentId = parentCategoryInput;
-    } else {
-      const pRes = await pool.query(
-        "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
-        [String(parentCategoryInput).trim()]
-      );
-      if (pRes.rows.length > 0) {
-        resolvedParentId = pRes.rows[0].id;
-      } else {
-        const pIns = await pool.query(
-          "INSERT INTO parent_categories (name, code) VALUES ($1, $2) RETURNING id",
-          [String(parentCategoryInput).trim(), String(parentCategoryInput).trim().slice(0, 3).toUpperCase()]
-        );
-        resolvedParentId = pIns.rows[0].id;
-      }
-    }
-
-    // B. Resolve category_id
-    let resolvedCatId = null;
-    if (isValidUUID(categoryInput)) {
-      resolvedCatId = categoryInput;
-    } else {
-      const catName = body.categoryName || categoryInput;
-      const cRes = await pool.query(
-        "SELECT id FROM categories WHERE UPPER(name) = UPPER($1) AND parent_category_id = $2 LIMIT 1",
-        [String(catName).trim(), resolvedParentId]
-      );
-      if (cRes.rows.length > 0) {
-        resolvedCatId = cRes.rows[0].id;
-      } else {
-        const cIns = await pool.query(
-          "INSERT INTO categories (parent_category_id, name, code) VALUES ($1, $2, $3) RETURNING id",
-          [resolvedParentId, String(catName).trim(), String(catName).trim().slice(0, 3).toUpperCase()]
-        );
-        resolvedCatId = cIns.rows[0].id;
-      }
-    }
-
-    // C. Resolve and insert each company mapping
-    const savedMappings = [];
-    for (const cmpInput of companyInputs) {
-      let resolvedCmpId = null;
-      if (isValidUUID(cmpInput)) {
-        resolvedCmpId = cmpInput;
-      } else {
-        const cmpName = body.companyName || cmpInput;
-        const compRes = await pool.query(
-          "SELECT id FROM companies WHERE UPPER(name) = UPPER($1) LIMIT 1",
-          [String(cmpName).trim()]
-        );
-        if (compRes.rows.length > 0) {
-          resolvedCmpId = compRes.rows[0].id;
-        } else {
-          const compIns = await pool.query(
-            "INSERT INTO companies (name, code) VALUES ($1, $2) RETURNING id",
-            [String(cmpName).trim(), String(cmpName).trim().slice(0, 3).toUpperCase()]
-          );
-          resolvedCmpId = compIns.rows[0].id;
-        }
-      }
-
-      // Check if mapping already exists
-      const existing = await pool.query(
-        `SELECT * FROM company_mappings 
-         WHERE parent_category_id = $1 AND category_id = $2 AND company_id = $3 LIMIT 1`,
-        [resolvedParentId, resolvedCatId, resolvedCmpId]
-      );
-
-      if (existing.rows.length > 0) {
-        savedMappings.push(existing.rows[0]);
-      } else {
-        const insertRes = await pool.query(
-          `INSERT INTO company_mappings (parent_category_id, category_id, company_id, pattern_id)
-           VALUES ($1, $2, $3, $4)
-           RETURNING *`,
-          [resolvedParentId, resolvedCatId, resolvedCmpId, isValidUUID(patternIdInput) ? patternIdInput : null]
-        );
-        savedMappings.push(insertRes.rows[0]);
-      }
-    }
-
-    res.json({
-      success: true,
-      mapping: savedMappings[0],
-      mappings: savedMappings
-    });
-  } catch (err) {
-    console.error("❌ SAVE MAPPING ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==============================================================================
-// 2. CREATE CATEGORY
-// ==============================================================================
-app.post("/api/categories", async (req, res) => {
-  try {
-    const { name, parentCategory, code } = req.body;
-    if (!name) return res.status(400).json({ success: false, error: "Category name is required" });
-
-    let parentId = null;
-    if (parentCategory) {
-      const pRes = await pool.query(
-        "SELECT id FROM parent_categories WHERE UPPER(name) = UPPER($1) LIMIT 1",
-        [String(parentCategory).trim()]
-      );
-      if (pRes.rows.length > 0) parentId = pRes.rows[0].id;
-    }
-
-    if (!parentId) {
-      const defaultP = await pool.query("SELECT id FROM parent_categories ORDER BY id LIMIT 1");
-      parentId = defaultP.rows[0]?.id;
-    }
-
-    const result = await pool.query(
-      `INSERT INTO categories (parent_category_id, name, code)
-       VALUES ($1, $2, $3)
-       ON CONFLICT (parent_category_id, name) DO UPDATE SET name = EXCLUDED.name
-       RETURNING *`,
-      [parentId, String(name).trim().toUpperCase(), (code || name.slice(0, 3)).toUpperCase()]
-    );
-
-    res.json({ success: true, category: result.rows[0] });
-  } catch (err) {
-    console.error("❌ CREATE CATEGORY ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-// ==============================================================================
-// 3. CREATE COMPANIES
-// ==============================================================================
-app.post("/api/companies", async (req, res) => {
-  try {
-    const items = Array.isArray(req.body.companies) ? req.body.companies : [req.body];
-    const saved = [];
-
-    for (const item of items) {
-      const name = item.name || item.companyName;
-      const code = item.code || item.companyCode || (name ? name.slice(0, 3).toUpperCase() : "CMP");
-      if (!name) continue;
-
-      const result = await pool.query(
-        `INSERT INTO companies (name, code)
-         VALUES ($1, $2)
-         ON CONFLICT (name) DO UPDATE SET code = EXCLUDED.code
-         RETURNING *`,
-        [String(name).trim().toUpperCase(), String(code).trim().toUpperCase()]
-      );
-      saved.push(result.rows[0]);
-    }
-
-    res.json({ success: true, companies: saved, company: saved[0] });
-  } catch (err) {
-    console.error("❌ CREATE COMPANY ERROR:", err);
-    res.status(500).json({ success: false, error: err.message });
-  }
 });
