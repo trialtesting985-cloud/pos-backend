@@ -7,31 +7,72 @@ const app = express();
 
 // Middleware
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: "50mb" }));
 
 const PORT = process.env.PORT || 5000;
 
-// ----------------------
-// DATABASE CONNECTION
-// ----------------------
+// -----------------------------------------------------------------------------
+// 1. DATABASE CONNECTION
+// -----------------------------------------------------------------------------
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
   ssl: {
-    rejectUnauthorized: false, // required for Supabase
+    rejectUnauthorized: false, // Required for Supabase / Cloud hosted PostgreSQL
   },
 });
 
 // Test DB connection on startup
-pool.connect()
+pool
+  .connect()
   .then(() => console.log("✅ Database connected"))
   .catch((err) => console.error("❌ DB connection error:", err.message));
 
-// Helper to check valid UUID
+// Helper: UUID Validator
 const isValidUUID = (str) => {
   return (
     typeof str === "string" &&
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(str.trim())
   );
+};
+
+// -----------------------------------------------------------------------------
+// 2. AUTHENTICATION & ROLE VERIFICATION MIDDLEWARE
+// -----------------------------------------------------------------------------
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers["authorization"];
+  const token = authHeader && authHeader.startsWith("Bearer ")
+    ? authHeader.slice(7)
+    : authHeader;
+
+  if (!token) {
+    return res.status(401).json({ success: false, message: "Authentication token required" });
+  }
+
+  try {
+    // Extract userId from 'jwt-<userId>' format or raw token
+    const userId = token.startsWith("jwt-") ? token.replace("jwt-", "") : token;
+
+    const result = await pool.query(
+      `SELECT id, username, full_name, role 
+       FROM users 
+       WHERE id::text = $1 OR username = $1 
+       LIMIT 1`,
+      [userId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(401).json({ success: false, message: "Invalid or expired session" });
+    }
+
+    req.user = {
+      ...result.rows[0],
+      role: (result.rows[0].role || "staff").toLowerCase(),
+    };
+    next();
+  } catch (err) {
+    console.error("Auth middleware error:", err);
+    return res.status(401).json({ success: false, message: "Authentication verification failed" });
+  }
 };
 
 // Health checks
@@ -43,9 +84,9 @@ app.get("/api/health", (req, res) => {
   res.json({ status: "ok", time: new Date().toISOString() });
 });
 
-// ----------------------
-// USER & AUTHENTICATION ROUTES
-// ----------------------
+// -----------------------------------------------------------------------------
+// 3. USER & AUTHENTICATION ROUTES
+// -----------------------------------------------------------------------------
 
 // 1. Get all users
 app.get("/api/users", async (req, res) => {
@@ -162,15 +203,299 @@ app.post(["/api/login", "/api/auth/login"], async (req, res) => {
   }
 });
 
-// ----------------------
-// INITIAL DATA (FRONTEND BOOT)
-// ----------------------
+// -----------------------------------------------------------------------------
+// 4. PRODUCTS & VARIANTS (CRUD & BATCH MANAGEMENT)
+// -----------------------------------------------------------------------------
+
+// GET all products
+app.get("/api/products", async (req, res) => {
+  try {
+    const result = await pool.query(`
+      SELECT 
+        p.id,
+        p.design_code AS "designCode",
+        p.category_id AS "categoryId",
+        cat.name AS "categoryName",
+        COALESCE(pc.name, 'Gents') AS "parentCategory",
+        p.company_id AS "companyId",
+        cmp.name AS "companyName",
+        p.pattern_id AS "patternId",
+        pat.name AS "patternName",
+        p.created_at AS "createdAt"
+      FROM products p
+      LEFT JOIN categories cat ON cat.id = p.category_id
+      LEFT JOIN parent_categories pc ON pc.id = cat.parent_category_id
+      LEFT JOIN companies cmp ON cmp.id = p.company_id
+      LEFT JOIN patterns pat ON pat.id = p.pattern_id
+      ORDER BY p.id DESC
+    `);
+    res.json({ success: true, products: result.rows, total: result.rows.length });
+  } catch (err) {
+    console.error("❌ GET PRODUCTS ERROR:", err);
+    res.status(500).json({ success: false, message: err.message });
+  }
+});
+
+// POST single product
+app.post("/api/products", async (req, res) => {
+  const { product, variants } = req.body;
+  if (!product || !product.designCode) {
+    return res.status(400).json({ success: false, message: "Product design code is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const pRes = await client.query(
+      `INSERT INTO products (company_id, category_id, pattern_id, design_code, created_at)
+       VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+       ON CONFLICT (design_code) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+       RETURNING id`,
+      [
+        isValidUUID(product.companyId) ? product.companyId : null,
+        isValidUUID(product.categoryId) ? product.categoryId : null,
+        isValidUUID(product.patternId) ? product.patternId : null,
+        product.designCode,
+      ]
+    );
+    const prodId = pRes.rows[0].id;
+
+    if (Array.isArray(variants)) {
+      for (const v of variants) {
+        await client.query(
+          `INSERT INTO variants (product_id, barcode, design_code, size, color, cost_price, mrp, stock_qty)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (barcode) DO UPDATE 
+           SET mrp = EXCLUDED.mrp, stock_qty = variants.stock_qty + EXCLUDED.stock_qty`,
+          [
+            prodId,
+            v.barcode,
+            v.designCode || product.designCode,
+            v.size,
+            v.color,
+            v.costPrice || 0,
+            v.mrp || 0,
+            v.stockQty || v.qty || 1,
+          ]
+        );
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: "Product saved successfully", productId: prodId });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ CREATE PRODUCT ERROR:", err);
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// POST Batch Products (used by ProductSetup & MRP Tagging)
+app.post(["/api/products/add-batch", "/api/products/add"], async (req, res) => {
+  const items = req.body.items || [req.body];
+  if (!Array.isArray(items) || items.length === 0) {
+    return res.status(400).json({ success: false, message: "Invalid batch items payload" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    for (const item of items) {
+      const { product, variants } = item;
+      if (!product?.designCode) continue;
+
+      const pRes = await client.query(
+        `INSERT INTO products (company_id, category_id, pattern_id, design_code, created_at)
+         VALUES ($1, $2, $3, $4, CURRENT_TIMESTAMP)
+         ON CONFLICT (design_code) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
+         RETURNING id`,
+        [
+          isValidUUID(product.companyId) ? product.companyId : null,
+          isValidUUID(product.categoryId) ? product.categoryId : null,
+          isValidUUID(product.patternId) ? product.patternId : null,
+          product.designCode,
+        ]
+      );
+      const prodId = pRes.rows[0].id;
+
+      if (Array.isArray(variants)) {
+        for (const v of variants) {
+          await client.query(
+            `INSERT INTO variants (product_id, barcode, design_code, size, color, cost_price, mrp, stock_qty)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT (barcode) DO UPDATE 
+             SET mrp = EXCLUDED.mrp, stock_qty = variants.stock_qty + EXCLUDED.stock_qty`,
+            [
+              prodId,
+              v.barcode,
+              v.designCode || product.designCode,
+              v.size,
+              v.color,
+              v.costPrice || 0,
+              v.mrp || 0,
+              v.stockQty || v.qty || 1,
+            ]
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true, message: `Successfully staged and saved ${items.length} product(s)` });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ ADD BATCH PRODUCTS ERROR:", err);
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// DELETE Product (Admin-Only & Transactional Historical Sales Protection)
+app.delete("/api/products/:id", authenticateToken, async (req, res) => {
+  const { id } = req.params;
+
+  // 1. Role verification
+  if (req.user?.role !== "admin") {
+    return res.status(403).json({
+      success: false,
+      message: "Access denied: Only Administrators are authorized to delete products.",
+    });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 2. Fetch product details
+    const prodRes = await client.query(
+      "SELECT id, design_code FROM products WHERE id::text = $1 OR design_code = $1 LIMIT 1",
+      [id]
+    );
+
+    if (prodRes.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Product not found" });
+    }
+
+    const productId = prodRes.rows[0].id;
+    const designCode = prodRes.rows[0].design_code;
+
+    // 3. Find associated variants and barcodes
+    const variantRes = await client.query(
+      "SELECT id, barcode FROM variants WHERE product_id = $1 OR design_code = $2",
+      [productId, designCode]
+    );
+
+    const variantIds = variantRes.rows.map((v) => v.id);
+    const barcodes = variantRes.rows.map((v) => v.barcode).filter(Boolean);
+
+    // 4. HISTORICAL SALES CHECK: Protect past invoices in bill_items
+    if (variantIds.length > 0 || barcodes.length > 0) {
+      const salesCheck = await client.query(
+        `SELECT bi.id, bi.barcode, b.bill_number 
+         FROM bill_items bi
+         LEFT JOIN bills b ON bi.bill_id = b.id
+         WHERE (bi.variant_id IS NOT NULL AND bi.variant_id = ANY($1::uuid[]))
+            OR bi.barcode = ANY($2::text[])
+         LIMIT 5`,
+        [
+          variantIds.length > 0 ? variantIds : ["00000000-0000-0000-0000-000000000000"],
+          barcodes.length > 0 ? barcodes : ["__NO_BARCODE__"],
+        ]
+      );
+
+      if (salesCheck.rows.length > 0) {
+        await client.query("ROLLBACK");
+        const sampleBills = salesCheck.rows
+          .map((r) => (r.bill_number ? `Bill #${r.bill_number}` : `Barcode ${r.barcode}`))
+          .join(", ");
+
+        return res.status(409).json({
+          success: false,
+          conflict: true,
+          message: `Cannot delete product: One or more variants are referenced in historical bills or invoices (${sampleBills}). Under retail accounting rules, historical financial data cannot be deleted.`,
+        });
+      }
+
+      // 5. Delete variants if no billing history exists
+      await client.query("DELETE FROM variants WHERE product_id = $1 OR design_code = $2", [
+        productId,
+        designCode,
+      ]);
+    }
+
+    // 6. Delete parent product
+    await client.query("DELETE FROM products WHERE id = $1", [productId]);
+
+    await client.query("COMMIT");
+    res.json({
+      success: true,
+      message: `Product and ${variantRes.rows.length} variant(s) permanently deleted.`,
+      deletedVariantsCount: variantRes.rows.length,
+    });
+  } catch (err) {
+    await client.query("ROLLBACK");
+    console.error("❌ DELETE PRODUCT ERROR:", err);
+    res.status(500).json({ success: false, message: err.message });
+  } finally {
+    client.release();
+  }
+});
+
+// -----------------------------------------------------------------------------
+// 5. INITIAL DATA (FRONTEND BOOT)
+// -----------------------------------------------------------------------------
 app.get("/api/initial-data", async (req, res) => {
   try {
     const [products, variants, categories, parentCategories, companies, mappings, sizes, patterns] =
       await Promise.all([
-        pool.query("SELECT * FROM products ORDER BY id"),
-        pool.query("SELECT * FROM variants ORDER BY id"),
+        pool.query(`
+          SELECT 
+            p.id,
+            p.design_code AS "designCode",
+            p.category_id AS "categoryId",
+            cat.name AS "categoryName",
+            COALESCE(pc.name, 'Gents') AS "parentCategory",
+            p.company_id AS "companyId",
+            cmp.name AS "companyName",
+            p.pattern_id AS "patternId",
+            pat.name AS "patternName",
+            p.created_at AS "createdAt"
+          FROM products p
+          LEFT JOIN categories cat ON cat.id = p.category_id
+          LEFT JOIN parent_categories pc ON pc.id = cat.parent_category_id
+          LEFT JOIN companies cmp ON cmp.id = p.company_id
+          LEFT JOIN patterns pat ON pat.id = p.pattern_id
+          ORDER BY p.id DESC
+        `),
+        pool.query(`
+          SELECT 
+            v.id,
+            v.product_id AS "productId",
+            v.barcode,
+            v.design_code AS "designCode",
+            v.size,
+            v.color,
+            v.cost_price AS "costPrice",
+            v.mrp,
+            v.stock_qty AS "stockQty",
+            v.stock_qty AS "stock",
+            p.category_id AS "categoryId",
+            cat.name AS "categoryName",
+            COALESCE(pc.name, 'Gents') AS "parentCategory",
+            cmp.name AS "companyName"
+          FROM variants v
+          LEFT JOIN products p ON p.id = v.product_id
+          LEFT JOIN categories cat ON cat.id = p.category_id
+          LEFT JOIN parent_categories pc ON pc.id = cat.parent_category_id
+          LEFT JOIN companies cmp ON cmp.id = p.company_id
+          ORDER BY v.id DESC
+        `),
         pool.query("SELECT * FROM categories ORDER BY name ASC"),
         pool.query("SELECT * FROM parent_categories ORDER BY name ASC"),
         pool.query("SELECT * FROM companies ORDER BY name ASC"),
@@ -234,9 +559,9 @@ app.get("/api/initial-data", async (req, res) => {
   }
 });
 
-// ----------------------
-// CATALOG & SETTINGS ROUTES
-// ----------------------
+// -----------------------------------------------------------------------------
+// 6. CATALOG & SETTINGS ROUTES
+// -----------------------------------------------------------------------------
 
 // Categories
 app.get("/api/categories", async (req, res) => {
@@ -351,7 +676,7 @@ app.post("/api/companies", async (req, res) => {
   }
 });
 
-// Patterns (GET, POST, DELETE)
+// Patterns
 app.get("/api/patterns", async (req, res) => {
   try {
     const result = await pool.query(`
@@ -420,7 +745,7 @@ app.delete("/api/patterns/:id", async (req, res) => {
   }
 });
 
-// Sizes (GET, POST, DELETE)
+// Sizes
 app.get("/api/sizes", async (req, res) => {
   try {
     const result = await pool.query("SELECT id, name, type, numeric_value FROM sizes ORDER BY id ASC");
@@ -474,9 +799,9 @@ app.delete("/api/sizes/:id", async (req, res) => {
   }
 });
 
-// ----------------------
-// MAPPINGS ROUTES
-// ----------------------
+// -----------------------------------------------------------------------------
+// 7. COMPANY MAPPINGS ROUTES
+// -----------------------------------------------------------------------------
 
 app.get("/api/get-mappings", async (req, res) => {
   try {
@@ -517,7 +842,6 @@ app.get("/api/get-mappings", async (req, res) => {
   }
 });
 
-// Save Mapping (Handles Single, Batch, and UUID Auto-Resolution)
 app.post("/api/save-mapping", async (req, res) => {
   try {
     const body = req.body;
@@ -580,7 +904,7 @@ app.post("/api/save-mapping", async (req, res) => {
       }
     }
 
-    // C. Resolve and insert each company mapping
+    // C. Resolve each company mapping
     const savedMappings = [];
     for (const cmpInput of companyInputs) {
       let resolvedCmpId = null;
@@ -603,7 +927,6 @@ app.post("/api/save-mapping", async (req, res) => {
         }
       }
 
-      // Check existing mapping
       const existing = await pool.query(
         `SELECT * FROM company_mappings 
          WHERE parent_category_id = $1 AND category_id = $2 AND company_id = $3 LIMIT 1`,
@@ -644,9 +967,9 @@ app.delete(["/api/company-mappings/:id", "/api/mappings/:id"], async (req, res) 
   }
 });
 
-// ----------------------
-// INVENTORY, BILLING & BARCODE
-// ----------------------
+// -----------------------------------------------------------------------------
+// 8. INVENTORY, BILLING & BARCODES
+// -----------------------------------------------------------------------------
 
 app.get("/api/inventory/search", async (req, res) => {
   try {
@@ -655,11 +978,11 @@ app.get("/api/inventory/search", async (req, res) => {
 
     const result = await pool.query(
       `
-      SELECT v.*, p.title
+      SELECT v.*, p.design_code AS title
       FROM variants v
       JOIN products p ON v.product_id = p.id
       WHERE 
-        p.title ILIKE $1 OR
+        p.design_code ILIKE $1 OR
         v.barcode ILIKE $1 OR
         v.design_code ILIKE $1
     `,
@@ -709,10 +1032,27 @@ app.post("/api/stock/in", async (req, res) => {
 app.post("/api/stock/out", async (req, res) => {
   const { barcode, qty } = req.body;
   try {
-    const result = await pool.query(`SELECT deduct_inventory_stock_atomic($1, $2, 'staff') AS result`, [barcode, qty]);
-    res.json(result.rows[0].result);
+    const variant = await pool.query("SELECT * FROM variants WHERE barcode = $1", [barcode]);
+    if (variant.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Barcode not found" });
+    }
+
+    const currentStock = variant.rows[0].stock_qty || 0;
+    if (currentStock < qty) {
+      return res.status(400).json({
+        success: false,
+        message: `Insufficient stock: Requested ${qty}, available ${currentStock}`,
+      });
+    }
+
+    await pool.query(
+      `UPDATE variants SET stock_qty = stock_qty - $1, updated_at = CURRENT_TIMESTAMP WHERE barcode = $2`,
+      [qty, barcode]
+    );
+
+    res.json({ success: true, message: `Successfully deducted ${qty} pcs` });
   } catch (err) {
-    res.json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
@@ -729,17 +1069,27 @@ app.post("/api/bills/create", async (req, res) => {
 
     for (const item of items) {
       const { barcode, qty } = item;
-      const result = await client.query(
-        `SELECT deduct_inventory_stock_atomic($1, $2, 'staff') AS result`,
-        [barcode, qty]
-      );
-      const response = result.rows[0].result;
-      if (!response.success) {
+
+      const variant = await client.query("SELECT * FROM variants WHERE barcode = $1", [barcode]);
+      if (variant.rows.length === 0) {
         await client.query("ROLLBACK");
-        return res.json(response);
+        return res.status(404).json({ success: false, message: `Barcode ${barcode} not found` });
       }
 
-      const variant = await client.query("SELECT mrp FROM variants WHERE barcode = $1", [barcode]);
+      const available = variant.rows[0].stock_qty || 0;
+      if (available < qty) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({
+          success: false,
+          message: `Insufficient stock for ${barcode}: Available ${available}, requested ${qty}`,
+        });
+      }
+
+      await client.query(
+        "UPDATE variants SET stock_qty = stock_qty - $1, updated_at = CURRENT_TIMESTAMP WHERE barcode = $2",
+        [qty, barcode]
+      );
+
       const price = Number(variant.rows[0]?.mrp || 0);
       grand_total += price * qty;
     }
@@ -778,7 +1128,7 @@ app.post("/api/bills/create", async (req, res) => {
     res.json({ success: true, message: "Bill created successfully", bill_id: billId, total: grand_total });
   } catch (err) {
     await client.query("ROLLBACK");
-    res.json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   } finally {
     client.release();
   }
@@ -796,17 +1146,17 @@ app.post("/api/bills/complete", async (req, res) => {
     );
 
     if (result.rows.length === 0) {
-      return res.json({ success: false, message: "Bill not found" });
+      return res.status(404).json({ success: false, message: "Bill not found" });
     }
     res.json({ success: true, message: "Payment completed", bill: result.rows[0] });
   } catch (err) {
-    res.json({ success: false, error: err.message });
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
-// ----------------------
-// START SERVER (Strictly at the very bottom after all routes)
-// ----------------------
+// -----------------------------------------------------------------------------
+// 9. START SERVER
+// -----------------------------------------------------------------------------
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`🚀 Server running on http://localhost:${PORT}`);
 });
